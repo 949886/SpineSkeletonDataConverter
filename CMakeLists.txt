@@ -66,6 +66,7 @@ add_executable(SpineSkeletonDataConverter
     "src/SkeletonData42JsonReader.cpp"
     "src/SkeletonData42JsonWriter.cpp"
     "src/SkeletonData43BinaryReader.cpp"
+    "src/SkeletonData43BinaryWriter.cpp"
 )
 
 target_include_directories(SpineSkeletonDataConverter PRIVATE "include")
