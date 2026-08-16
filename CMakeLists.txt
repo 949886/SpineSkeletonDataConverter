@@ -4,9 +4,6 @@ project(SpineSkeletonDataConverter)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# Add spine-c/spine-cpp for syntax prompting. These won't be linked to the final executable.
-# Comment out if you don't need syntax prompting.
-
 macro(add_spine_c version)
     file(GLOB SPINE_C
         "spine/spine-c-${version}/include/spine/*.h"
@@ -68,6 +65,7 @@ add_executable(SpineSkeletonDataConverter
     "src/SkeletonData42BinaryWriter.cpp"
     "src/SkeletonData42JsonReader.cpp"
     "src/SkeletonData42JsonWriter.cpp"
+    "src/SkeletonData43BinaryReader.cpp"
 )
 
 target_include_directories(SpineSkeletonDataConverter PRIVATE "include")
