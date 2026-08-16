@@ -1,4 +1,5 @@
 import argparse
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -53,6 +54,69 @@ def build_atlas_command(executable: Path, input_path: Path, output_dir: Path) ->
 	return [str(executable), str(input_path), str(output_dir)]
 
 
+def is_spine_43_target(version: str | None) -> bool:
+	if not version:
+		return False
+	parts = version.split(".")
+	if len(parts) != 3:
+		return False
+	try:
+		return (int(parts[0]), int(parts[1])) >= (4, 3)
+	except ValueError:
+		return False
+
+
+def read_atlas_page_names(atlas_path: Path) -> list[str]:
+	"""Return atlas page texture paths in declaration order."""
+	text = atlas_path.read_text(encoding="utf-8-sig")
+	pages: list[str] = []
+	expect_page = True
+
+	for raw_line in text.splitlines():
+		line = raw_line.strip()
+		if not line:
+			expect_page = True
+			continue
+		if expect_page:
+			if ":" in line:
+				# Atlas-level metadata can appear before the first page.
+				continue
+			pages.append(line)
+			expect_page = False
+
+	return pages
+
+
+def copy_atlas_for_43(input_path: Path, output_path: Path) -> None:
+	pages = read_atlas_page_names(input_path)
+	if not pages:
+		raise ValueError(f"Atlas contains no texture page: {input_path}")
+
+	# Keep the source atlas syntax, but remove BOM/leading blank lines so the
+	# first line is always the actual texture page name for strict consumers.
+	text = input_path.read_text(encoding="utf-8-sig")
+	normalized = text.lstrip("\r\n")
+	output_path.parent.mkdir(parents=True, exist_ok=True)
+	output_path.write_text(normalized, encoding="utf-8", newline="\n")
+	print(f"[atlas-copy] {input_path} -> {output_path}")
+
+	for page_name in pages:
+		page_rel = Path(page_name.replace("\\", "/"))
+		if page_rel.is_absolute() or ".." in page_rel.parts:
+			raise ValueError(f"Unsafe atlas texture path '{page_name}' in {input_path}")
+
+		texture_source = input_path.parent / page_rel
+		if not texture_source.is_file():
+			raise FileNotFoundError(
+				f"Atlas texture does not exist: {texture_source} (referenced by {input_path.name})"
+			)
+
+		texture_destination = output_path.parent / page_rel
+		texture_destination.parent.mkdir(parents=True, exist_ok=True)
+		shutil.copy2(texture_source, texture_destination)
+		print(f"[texture-copy] {texture_source} -> {texture_destination}")
+
+
 def process_files(args: argparse.Namespace) -> None:
 	input_dir = Path(args.input_directory).resolve()
 	output_dir = Path(args.output_directory).resolve()
@@ -63,7 +127,7 @@ def process_files(args: argparse.Namespace) -> None:
 	output_dir.mkdir(parents=True, exist_ok=True)
 
 	converter_exe = locate_executable("SpineSkeletonDataConverter.exe")
-	atlas_exe = locate_executable("SpineAtlasDowngrade.exe")
+	atlas_exe = None if is_spine_43_target(args.version) else locate_executable("SpineAtlasDowngrade.exe")
 
 	for path in input_dir.rglob("*"):
 		if not path.is_file():
@@ -90,9 +154,13 @@ def process_files(args: argparse.Namespace) -> None:
 			print(f"[converter] {format_command(command)}")
 			subprocess.run(command, check=True)
 		else:  # .atlas
-			command = build_atlas_command(atlas_exe, path, output_dir / relative_path.parent)
-			print(f"[atlas] {format_command(command)}")
-			subprocess.run(command, check=True)
+			if is_spine_43_target(args.version):
+				copy_atlas_for_43(path, output_dir / relative_path)
+			else:
+				assert atlas_exe is not None
+				command = build_atlas_command(atlas_exe, path, output_dir / relative_path.parent)
+				print(f"[atlas] {format_command(command)}")
+				subprocess.run(command, check=True)
 
 
 def parse_arguments(argv: list[str]) -> argparse.Namespace:
