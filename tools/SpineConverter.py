@@ -87,19 +87,28 @@ def read_atlas_page_names(atlas_path: Path) -> list[str]:
 	return pages
 
 
-def copy_atlas_for_43(input_path: Path, output_path: Path) -> None:
+def normalize_atlas_for_spine43(text: str, expected_first_page: str) -> str:
+	# Ark-Models contains atlas files with a physical blank line before the
+	# first page. Keep the atlas data otherwise unchanged, but make the first
+	# physical line the texture filename for strict/runtime parsers.
+	normalized = text.lstrip("\ufeff\r\n\t ")
+	if not normalized:
+		raise ValueError("Atlas became empty after removing leading whitespace")
+
+	first_line = normalized.splitlines()[0].strip()
+	if first_line != expected_first_page:
+		raise ValueError(
+			f"Atlas first physical line must be texture page '{expected_first_page}', got '{first_line}'"
+		)
+	return normalized
+
+
+def atlas_texture_pairs(input_path: Path, output_path: Path) -> tuple[list[str], list[tuple[Path, Path]]]:
 	pages = read_atlas_page_names(input_path)
 	if not pages:
 		raise ValueError(f"Atlas contains no texture page: {input_path}")
 
-	# Keep the source atlas syntax, but remove BOM/leading blank lines so the
-	# first line is always the actual texture page name for strict consumers.
-	text = input_path.read_text(encoding="utf-8-sig")
-	normalized = text.lstrip("\r\n")
-	output_path.parent.mkdir(parents=True, exist_ok=True)
-	output_path.write_text(normalized, encoding="utf-8", newline="\n")
-	print(f"[atlas-copy] {input_path} -> {output_path}")
-
+	pairs: list[tuple[Path, Path]] = []
 	for page_name in pages:
 		page_rel = Path(page_name.replace("\\", "/"))
 		if page_rel.is_absolute() or ".." in page_rel.parts:
@@ -110,11 +119,43 @@ def copy_atlas_for_43(input_path: Path, output_path: Path) -> None:
 			raise FileNotFoundError(
 				f"Atlas texture does not exist: {texture_source} (referenced by {input_path.name})"
 			)
+		pairs.append((texture_source, output_path.parent / page_rel))
 
-		texture_destination = output_path.parent / page_rel
+	return pages, pairs
+
+
+def copy_atlas_textures_for_43(input_path: Path, output_path: Path) -> list[str]:
+	pages, pairs = atlas_texture_pairs(input_path, output_path)
+	for texture_source, texture_destination in pairs:
 		texture_destination.parent.mkdir(parents=True, exist_ok=True)
-		shutil.copy2(texture_source, texture_destination)
-		print(f"[texture-copy] {texture_source} -> {texture_destination}")
+		if texture_source.resolve() != texture_destination.resolve():
+			shutil.copy2(texture_source, texture_destination)
+		print(f"[texture-ready] {texture_destination}")
+	return pages
+
+
+def write_atlas_for_43(input_path: Path, output_path: Path, pages: list[str]) -> None:
+	text = input_path.read_text(encoding="utf-8-sig")
+	normalized = normalize_atlas_for_spine43(text, pages[0])
+	output_path.parent.mkdir(parents=True, exist_ok=True)
+
+	# Write to a non-atlas temporary filename, then atomically replace the
+	# target. This prevents Godot from importing a partially written atlas.
+	temp_path = output_path.with_name(output_path.name + ".tmp")
+	temp_path.write_text(normalized, encoding="utf-8", newline="\n")
+	raw = temp_path.read_bytes()
+	expected = pages[0].encode("utf-8")
+	if raw.startswith(b"\xef\xbb\xbf"):
+		temp_path.unlink(missing_ok=True)
+		raise ValueError(f"Output atlas still contains a UTF-8 BOM: {output_path}")
+	if not raw.startswith(expected + b"\n") and raw != expected:
+		preview = raw[:80].decode("utf-8", errors="replace").replace("\r", "\\r").replace("\n", "\\n")
+		temp_path.unlink(missing_ok=True)
+		raise ValueError(
+			f"Output atlas does not start with '{pages[0]}'. First bytes: {preview!r}"
+		)
+	temp_path.replace(output_path)
+	print(f"[atlas-ready] {output_path} (first page: {pages[0]})")
 
 
 def process_files(args: argparse.Namespace) -> None:
@@ -127,16 +168,33 @@ def process_files(args: argparse.Namespace) -> None:
 	output_dir.mkdir(parents=True, exist_ok=True)
 
 	converter_exe = locate_executable("SpineSkeletonDataConverter.exe")
-	atlas_exe = None if is_spine_43_target(args.version) else locate_executable("SpineAtlasDowngrade.exe")
+	is_43 = is_spine_43_target(args.version)
+	atlas_exe = None if is_43 else locate_executable("SpineAtlasDowngrade.exe")
 
-	for path in input_dir.rglob("*"):
-		if not path.is_file():
-			continue
+	files = [
+		path for path in input_dir.rglob("*")
+		if path.is_file() and path.suffix.lower() in {".json", ".skel", ".atlas"}
+	]
 
+	# For Spine 4.3, make every texture physically present before exposing any
+	# atlas file to a live Godot editor. Godot's atlas importer may run as soon
+	# as the atlas appears and ResourceLoader cannot load a PNG that has not
+	# finished/started its own import yet (spine-runtimes issue #2385).
+	atlas_pages: dict[Path, list[str]] = {}
+	if is_43:
+		for path in files:
+			if path.suffix.lower() != ".atlas":
+				continue
+			relative_path = path.relative_to(input_dir)
+			output_path = output_dir / relative_path
+			atlas_pages[path] = copy_atlas_textures_for_43(path, output_path)
+
+		for path, pages in atlas_pages.items():
+			relative_path = path.relative_to(input_dir)
+			write_atlas_for_43(path, output_dir / relative_path, pages)
+
+	for path in files:
 		suffix = path.suffix.lower()
-		if suffix not in {".json", ".skel", ".atlas"}:
-			continue
-
 		relative_path = path.relative_to(input_dir)
 		destination_parent = (output_dir / relative_path).parent
 		destination_parent.mkdir(parents=True, exist_ok=True)
@@ -153,14 +211,11 @@ def process_files(args: argparse.Namespace) -> None:
 			)
 			print(f"[converter] {format_command(command)}")
 			subprocess.run(command, check=True)
-		else:  # .atlas
-			if is_spine_43_target(args.version):
-				copy_atlas_for_43(path, output_dir / relative_path)
-			else:
-				assert atlas_exe is not None
-				command = build_atlas_command(atlas_exe, path, output_dir / relative_path.parent)
-				print(f"[atlas] {format_command(command)}")
-				subprocess.run(command, check=True)
+		elif not is_43:
+			assert atlas_exe is not None
+			command = build_atlas_command(atlas_exe, path, output_dir / relative_path.parent)
+			print(f"[atlas] {format_command(command)}")
+			subprocess.run(command, check=True)
 
 
 def parse_arguments(argv: list[str]) -> argparse.Namespace:
